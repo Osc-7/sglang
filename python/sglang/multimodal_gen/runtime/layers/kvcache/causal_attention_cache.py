@@ -103,6 +103,9 @@ class CausalSelfAttentionKVCache:
             and self.attention_window_size == num_new_tokens
         )
 
+    # cache bookkeeping uses data-dependent `.item()` indices which Inductor
+    # miscompiles (unbacked-symint NameError); keep it out of compiled graphs.
+    @torch.compiler.disable
     def update_and_get_attention_kv(
         self,
         *,

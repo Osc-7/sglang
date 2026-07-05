@@ -19,6 +19,10 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.entrypoints.output_run_paths import (
+    allocate_batch_run_output_dir,
+    should_allocate_batch_run_output_dir,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
     ListLorasReq,
@@ -206,6 +210,9 @@ class DiffGenerator:
             sampling_params_kwargs.get("prompt_path"),
         )
         user_output_file_name = sampling_params_kwargs.get("output_file_name")
+        disable_batch_run_output_dir = bool(
+            sampling_params_kwargs.pop("disable_batch_run_output_dir", False)
+        )
 
         if len(prompts) > 1 and user_output_file_name is not None:
             raise ValueError(
@@ -218,6 +225,18 @@ class DiffGenerator:
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
+
+        if should_allocate_batch_run_output_dir(
+            num_prompts=len(prompts),
+            prompt_path=sampling_params_kwargs.get("prompt_path"),
+            output_file_path_override=disable_batch_run_output_dir,
+        ):
+            base_output_path = (
+                sampling_params_orig.output_path or self.server_args.output_path
+            )
+            sampling_params_orig.output_path = allocate_batch_run_output_dir(
+                base_output_path
+            )
 
         request_groups: list[list[Req]] = []
         image_paths_per_prompt = self._resolve_image_paths_per_prompt(

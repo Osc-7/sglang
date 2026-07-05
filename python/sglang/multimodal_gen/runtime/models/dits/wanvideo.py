@@ -212,12 +212,16 @@ class WanT2VCrossAttention(WanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, is_cross_attention=True)
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, crossattn_cache=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            crossattn_cache: Accepted for API compatibility with the causal
+                rolling-forcing / self-forcing path; this T2V cross-attention
+                recomputes K/V from ``context`` each call and does not use the
+                cache, so it is intentionally ignored.
         """
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:

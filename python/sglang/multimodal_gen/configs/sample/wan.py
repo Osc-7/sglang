@@ -285,3 +285,8 @@ class Turbo_Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
 @dataclass
 class SelfForcingWanT2V480PConfig(WanT2V_1_3B_SamplingParams):
     pass
+
+
+@dataclass
+class RollingForcingWanT2V480PSamplingParams(WanT2V_1_3B_SamplingParams):
+    num_frames: int = 81

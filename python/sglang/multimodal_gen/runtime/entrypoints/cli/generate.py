@@ -176,6 +176,8 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
 
     sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
     _apply_output_file_path_override(args, sampling_params_kwargs)
+    if args.output_file_path:
+        sampling_params_kwargs["disable_batch_run_output_dir"] = True
     sampling_params_kwargs["request_id"] = generate_request_id()
 
     # Handle diffusers-specific kwargs passed via CLI

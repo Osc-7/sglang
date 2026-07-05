@@ -273,3 +273,45 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
         default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Causal / RF checkpoints count ``num_frames`` in latent space (e.g. 81
+        # latent frames -> ~321 pixel frames after Wan causal VAE decode), not
+        # pixel frames like the standard Wan T2V pipeline.
+        self.vae_config.use_temporal_scaling_frames = False
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # Wan causal / RF is memory-light on A100-class GPUs; keep text encoder
+        # and VAE resident to avoid layerwise-offload step spikes during decode.
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "text_encoder",
+                "vae",
+            ),
+        )
+
+
+@dataclass
+class RollingForcingWanT2V480PConfig(SelfForcingWanT2V480PConfig):
+    """Rolling Forcing on Wan2.1-T2V-1.3B (TencentARC/RollingForcing)."""
+
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [1000, 800, 600, 400, 200]
+    )
+    context_noise: int = 0
+    rolling_forcing_checkpoint_path: str = (
+        "/data/ckpts/TencentARC/RollingForcing/checkpoints/rolling_forcing_dmd.pt"
+    )
+    rolling_forcing_use_ema: bool = True
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.dit_config.arch_config.num_frames_per_block = 3
+        self.dit_config.arch_config.sliding_window_num_frames = 21
+        self.dit_config.arch_config.sink_size = 0
+        # max-autotune can fail on RF's large causal attention shapes; use default
+        # when the user opts into --enable-torch-compile.
+        self.dit_config.torch_compile_mode = "default"

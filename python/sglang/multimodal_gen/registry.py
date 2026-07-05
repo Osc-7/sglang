@@ -89,6 +89,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
+    RollingForcingWanT2V480PConfig,
     FastWan2_2_TI2V_5B_Config,
     TurboWanI2V720Config,
     TurboWanT2V1_3B480PConfig,
@@ -149,6 +150,7 @@ from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
 )
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
+    RollingForcingWanT2V480PSamplingParams,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
     Wan2_2_I2V_A14B_SamplingParam,
@@ -769,6 +771,16 @@ def _register_configs():
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=RollingForcingWanT2V480PSamplingParams,
+        pipeline_config_cls=RollingForcingWanT2V480PConfig,
+        hf_model_paths=[
+            "/data/ckpts/Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "rollingforcing" in hf_id.lower(),
         ],
     )
     # MOVA
