@@ -311,7 +311,8 @@ class RollingForcingWanT2V480PConfig(SelfForcingWanT2V480PConfig):
         super().__post_init__()
         self.dit_config.arch_config.num_frames_per_block = 3
         self.dit_config.arch_config.sliding_window_num_frames = 21
-        self.dit_config.arch_config.sink_size = 0
+        # Keep the first block (3 latent frames) as the attention sink anchor.
+        self.dit_config.arch_config.sink_size = 3
         # max-autotune can fail on RF's large causal attention shapes; use default
         # when the user opts into --enable-torch-compile.
         self.dit_config.torch_compile_mode = "default"

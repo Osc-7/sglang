@@ -477,6 +477,7 @@ class RollingForcingDenoisingStage(CausalDMDDenoisingStage):
                     attn_metadata=attn_metadata,
                     target_dtype=target_dtype,
                     autocast_enabled=autocast_enabled,
+                    updating_cache=True,
                 )
                 if profile and device.type == "cuda":
                     win_ev_end.record()

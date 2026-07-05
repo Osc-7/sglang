@@ -498,6 +498,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
         attn_metadata,
         target_dtype: torch.dtype,
         autocast_enabled: bool,
+        updating_cache: bool = False,
+        cache_start_tokens: int | None = None,
     ) -> torch.Tensor:
         with (
             torch.autocast(
@@ -518,7 +520,13 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start_tokens,
+                cache_start=(
+                    current_start_tokens
+                    if cache_start_tokens is None
+                    else cache_start_tokens
+                ),
                 start_frame=start_frame,
+                updating_cache=updating_cache,
                 **image_kwargs,
                 **pos_cond_kwargs,
             )
@@ -689,11 +697,13 @@ class CausalDMDDenoisingStage(DenoisingStage):
         attn_metadata,
         target_dtype: torch.dtype,
         autocast_enabled: bool,
+        updating_cache: bool = False,
     ) -> None:
         """fill the self-attn KV cache by performing a one-time forward on DiT"""
         context_noise = getattr(server_args.pipeline_config, "context_noise", 0)
+        num_context_frames = context_input.shape[2]
         timestep = torch.full(
-            (context_input.shape[0], 1),
+            (context_input.shape[0], num_context_frames),
             int(context_noise),
             device=context_input.device,
             dtype=torch.long,
@@ -713,6 +723,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             attn_metadata=attn_metadata,
             target_dtype=target_dtype,
             autocast_enabled=autocast_enabled,
+            updating_cache=updating_cache,
         )
 
     def _warm_up_causal_context_cache(

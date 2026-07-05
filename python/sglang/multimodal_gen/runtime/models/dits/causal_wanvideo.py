@@ -74,6 +74,42 @@ from sglang.srt.utils import add_prefix
 logger = init_logger(__name__)
 
 
+def _rope_latent_frames(
+    x: torch.Tensor,
+    *,
+    num_frames: int,
+    post_patch_height: int,
+    post_patch_width: int,
+    hidden_size: int,
+    num_heads: int,
+    start_frame: int,
+) -> torch.Tensor:
+    """Apply 3D RoPE to ``num_frames`` latent frames starting at ``start_frame``."""
+    head_dim = hidden_size // num_heads
+    rope_dim_list = [
+        head_dim - 4 * (head_dim // 6),
+        2 * (head_dim // 6),
+        2 * (head_dim // 6),
+    ]
+    cos, sin = get_rotary_pos_embed(
+        (num_frames, post_patch_height, post_patch_width),
+        hidden_size,
+        num_heads,
+        rope_dim_list,
+        dtype=(
+            torch.float64
+            if current_platform.is_float64_supported()
+            else torch.float32
+        ),
+        rope_theta=10000,
+        start_frame=start_frame,
+        device=x.device,
+    )
+    return _apply_rotary_emb(
+        x, cos.float(), sin.float(), is_neox_style=False
+    ).type_as(x)
+
+
 class CausalWanSelfAttention(nn.Module):
     def __init__(
         self,
@@ -86,6 +122,9 @@ class CausalWanSelfAttention(nn.Module):
         parallel_attention=False,
         head_dim: int | None = None,
         head_start: int = 0,
+        num_frames_per_block: int = 3,
+        sliding_window_num_frames: int = 21,
+        rope_num_heads: int | None = None,
     ) -> None:
         if head_dim is None:
             assert dim % num_heads == 0
@@ -97,6 +136,9 @@ class CausalWanSelfAttention(nn.Module):
         self.head_start = head_start
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        self.num_frames_per_block = num_frames_per_block
+        self.sliding_window_num_frames = sliding_window_num_frames
+        self.rope_num_heads = rope_num_heads or num_heads
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
@@ -115,6 +157,219 @@ class CausalWanSelfAttention(nn.Module):
             ),
         )
 
+    def _cache_head_slice(
+        self, key: torch.Tensor, kv_cache: CausalSelfAttentionKVCache
+    ) -> slice | None:
+        num_input_heads = key.shape[2]
+        num_cache_heads = kv_cache.k.shape[2]
+        if num_cache_heads == num_input_heads:
+            return None
+        return slice(self.head_start, self.head_start + num_input_heads)
+
+    @torch.compiler.disable
+    def _forward_with_attention_sink(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        roped_query: torch.Tensor,
+        roped_key: torch.Tensor,
+        kv_cache: CausalSelfAttentionKVCache,
+        *,
+        current_start: int,
+        cache_start: int | None,
+        updating_cache: bool,
+        tokens_per_frame: int,
+        post_patch_height: int,
+        post_patch_width: int,
+    ) -> torch.Tensor:
+        """Rolling Forcing attention sink: anchor + working cache + current keys."""
+        if cache_start is None:
+            cache_start = current_start
+
+        block_length = self.num_frames_per_block * tokens_per_frame
+        max_attention_size = self.sliding_window_num_frames * tokens_per_frame
+        sink_tokens = kv_cache.sink_tokens
+        if sink_tokens == 0:
+            sink_tokens = block_length
+
+        cache_end = cache_start + block_length
+        kv_cache_size = kv_cache.cache_size
+        global_end_index, local_end_index_prev = kv_cache._read_indices()
+        num_new_tokens = cache_end - global_end_index
+
+        cache_head_slice = self._cache_head_slice(k, kv_cache)
+
+        if num_new_tokens > 0 and (
+            num_new_tokens + local_end_index_prev > kv_cache_size
+        ):
+            num_evicted_tokens = (
+                num_new_tokens + local_end_index_prev - kv_cache_size
+            )
+            num_rolled_tokens = (
+                local_end_index_prev - num_evicted_tokens - sink_tokens
+            )
+            if num_rolled_tokens > 0:
+                src = slice(
+                    sink_tokens + num_evicted_tokens,
+                    sink_tokens + num_evicted_tokens + num_rolled_tokens,
+                )
+                dst = slice(sink_tokens, sink_tokens + num_rolled_tokens)
+                if cache_head_slice is None:
+                    kv_cache.k[:, dst] = kv_cache.k[:, src].clone()
+                    kv_cache.v[:, dst] = kv_cache.v[:, src].clone()
+                else:
+                    kv_cache.k[:, dst, cache_head_slice, :] = kv_cache.k[
+                        :, src, cache_head_slice, :
+                    ].clone()
+                    kv_cache.v[:, dst, cache_head_slice, :] = kv_cache.v[
+                        :, src, cache_head_slice, :
+                    ].clone()
+
+            local_end_index = (
+                local_end_index_prev
+                + cache_end
+                - global_end_index
+                - num_evicted_tokens
+            )
+            local_start_index = local_end_index - block_length
+            write_k = roped_key[:, :block_length]
+            if cache_head_slice is None:
+                kv_cache.k[:, local_start_index:local_end_index] = write_k
+                kv_cache.v[:, local_start_index:local_end_index] = v[
+                    :, :block_length
+                ]
+            else:
+                kv_cache.k[
+                    :, local_start_index:local_end_index, cache_head_slice, :
+                ] = write_k
+                kv_cache.v[
+                    :, local_start_index:local_end_index, cache_head_slice, :
+                ] = v[:, :block_length]
+        else:
+            local_end_index = (
+                local_end_index_prev + cache_end - global_end_index
+            )
+            local_start_index = local_end_index - block_length
+            if local_start_index == 0:
+                write_k = k[:, :block_length]
+            else:
+                write_k = roped_key[:, :block_length]
+            if cache_head_slice is None:
+                kv_cache.k[:, local_start_index:local_end_index] = write_k
+                kv_cache.v[:, local_start_index:local_end_index] = v[
+                    :, :block_length
+                ]
+            else:
+                kv_cache.k[
+                    :, local_start_index:local_end_index, cache_head_slice, :
+                ] = write_k
+                kv_cache.v[
+                    :, local_start_index:local_end_index, cache_head_slice, :
+                ] = v[:, :block_length]
+
+        if num_new_tokens > 0:
+            kv_cache._write_indices(
+                global_end_index=cache_end,
+                local_end_index=local_end_index,
+            )
+
+        current_start_frame = current_start // tokens_per_frame
+
+        if local_start_index == 0:
+            return self.attn(roped_query, roped_key, v)
+
+        if updating_cache:
+            extract_cache_end = local_end_index
+            extract_cache_start = max(
+                0, local_end_index - max_attention_size
+            )
+            if cache_head_slice is None:
+                working_cache_key = kv_cache.k[
+                    :, extract_cache_start:extract_cache_end
+                ].clone()
+                working_cache_v = kv_cache.v[
+                    :, extract_cache_start:extract_cache_end
+                ]
+            else:
+                working_cache_key = kv_cache.k[
+                    :, extract_cache_start:extract_cache_end, cache_head_slice, :
+                ].clone()
+                working_cache_v = kv_cache.v[
+                    :, extract_cache_start:extract_cache_end, cache_head_slice, :
+                ]
+
+            if extract_cache_start == 0:
+                working_cache_key[:, :block_length] = _rope_latent_frames(
+                    working_cache_key[:, :block_length],
+                    num_frames=self.num_frames_per_block,
+                    post_patch_height=post_patch_height,
+                    post_patch_width=post_patch_width,
+                    hidden_size=self.dim,
+                    num_heads=self.rope_num_heads,
+                    start_frame=0,
+                )
+
+            return self.attn(
+                roped_query, working_cache_key, working_cache_v
+            )
+
+        query_length = roped_query.shape[1]
+        working_cache_max_length = (
+            max_attention_size - query_length - block_length
+        )
+        extract_cache_end = local_start_index
+        extract_cache_start = max(
+            block_length,
+            local_start_index - working_cache_max_length,
+        )
+        if cache_head_slice is None:
+            working_cache_key = kv_cache.k[
+                :, extract_cache_start:extract_cache_end
+            ]
+            working_cache_v = kv_cache.v[:, extract_cache_start:extract_cache_end]
+        else:
+            working_cache_key = kv_cache.k[
+                :, extract_cache_start:extract_cache_end, cache_head_slice, :
+            ]
+            working_cache_v = kv_cache.v[
+                :, extract_cache_start:extract_cache_end, cache_head_slice, :
+            ]
+
+        working_cache_frame_length = (
+            working_cache_key.shape[1] // tokens_per_frame
+        )
+        rope_start_frame = (
+            current_start_frame - working_cache_frame_length - self.num_frames_per_block
+        )
+        if cache_head_slice is None:
+            anchor_cache_key = _rope_latent_frames(
+                kv_cache.k[:, :block_length],
+                num_frames=self.num_frames_per_block,
+                post_patch_height=post_patch_height,
+                post_patch_width=post_patch_width,
+                hidden_size=self.dim,
+                num_heads=self.rope_num_heads,
+                start_frame=rope_start_frame,
+            )
+            anchor_cache_v = kv_cache.v[:, :block_length]
+        else:
+            anchor_cache_key = _rope_latent_frames(
+                kv_cache.k[:, :block_length, cache_head_slice, :],
+                num_frames=self.num_frames_per_block,
+                post_patch_height=post_patch_height,
+                post_patch_width=post_patch_width,
+                hidden_size=self.dim,
+                num_heads=self.rope_num_heads,
+                start_frame=rope_start_frame,
+            )
+            anchor_cache_v = kv_cache.v[:, :block_length, cache_head_slice, :]
+
+        input_key = torch.cat(
+            [anchor_cache_key, working_cache_key, roped_key], dim=1
+        )
+        input_v = torch.cat([anchor_cache_v, working_cache_v, v], dim=1)
+        return self.attn(roped_query, input_key, input_v)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -125,6 +380,10 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache: CausalSelfAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        updating_cache: bool = False,
+        tokens_per_frame: int | None = None,
+        post_patch_height: int | None = None,
+        post_patch_width: int | None = None,
     ):
         r"""
         Args:
@@ -183,6 +442,27 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
+            use_attention_sink = (
+                kv_cache.sink_tokens > 0
+                and tokens_per_frame is not None
+                and post_patch_height is not None
+                and post_patch_width is not None
+            )
+            if use_attention_sink:
+                return self._forward_with_attention_sink(
+                    k,
+                    v,
+                    roped_query,
+                    roped_key,
+                    kv_cache,
+                    current_start=current_start,
+                    cache_start=cache_start,
+                    updating_cache=updating_cache,
+                    tokens_per_frame=tokens_per_frame,
+                    post_patch_height=post_patch_height,
+                    post_patch_width=post_patch_width,
+                )
+
             if kv_cache.can_direct_current_attention(roped_key.shape[1]):
                 return self.attn(roped_query, roped_key, v)
 
@@ -217,6 +497,8 @@ class CausalWanTransformerBlock(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
+        num_frames_per_block: int = 3,
+        sliding_window_num_frames: int = 21,
     ):
         super().__init__()
 
@@ -283,6 +565,9 @@ class CausalWanTransformerBlock(nn.Module):
             eps=eps,
             head_dim=dim_head,
             head_start=head_start,
+            num_frames_per_block=num_frames_per_block,
+            sliding_window_num_frames=sliding_window_num_frames,
+            rope_num_heads=num_heads,
         )
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -342,6 +627,9 @@ class CausalWanTransformerBlock(nn.Module):
         crossattn_cache: CrossAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        updating_cache: bool = False,
+        post_patch_height: int | None = None,
+        post_patch_width: int | None = None,
     ) -> torch.Tensor:
         # hidden_states.shape: [batch_size, seq_length, inner_dim]
         # temb.shape: [batch_size, num_frames, 6, inner_dim]
@@ -401,6 +689,10 @@ class CausalWanTransformerBlock(nn.Module):
             kv_cache,
             current_start,
             cache_start,
+            updating_cache=updating_cache,
+            tokens_per_frame=frame_seqlen,
+            post_patch_height=post_patch_height,
+            post_patch_width=post_patch_width,
         )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -497,6 +789,8 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     self._supported_attention_backends,
                     prefix=f"{config.prefix}.blocks.{i}",
                     quant_config=quant_config,
+                    num_frames_per_block=config.arch_config.num_frames_per_block,
+                    sliding_window_num_frames=config.arch_config.sliding_window_num_frames,
                 )
                 for i in range(config.num_layers)
             ]
@@ -614,6 +908,7 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         current_start: int = 0,
         cache_start: int = 0,
         start_frame: int = 0,
+        updating_cache: bool = False,
     ) -> torch.Tensor:
         r"""
         Run the diffusion model with kv caching.
@@ -701,6 +996,9 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     "current_start": current_start,
                     "cache_start": cache_start,
                     "block_mask": self.block_mask,
+                    "updating_cache": updating_cache,
+                    "post_patch_height": post_patch_height,
+                    "post_patch_width": post_patch_width,
                 }
                 hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -717,6 +1015,9 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     "current_start": current_start,
                     "cache_start": cache_start,
                     "block_mask": self.block_mask,
+                    "updating_cache": updating_cache,
+                    "post_patch_height": post_patch_height,
+                    "post_patch_width": post_patch_width,
                 }
                 hidden_states = block(
                     hidden_states,

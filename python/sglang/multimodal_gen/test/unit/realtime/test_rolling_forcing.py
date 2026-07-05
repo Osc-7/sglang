@@ -100,6 +100,17 @@ def test_rolling_forcing_config_uses_latent_frame_count():
     assert latent_frames == 81
 
 
+def test_rolling_forcing_config_enables_attention_sink():
+    from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+        RollingForcingWanT2V480PConfig,
+    )
+
+    rf_config = RollingForcingWanT2V480PConfig()
+    assert rf_config.dit_config.arch_config.sink_size == 3
+    assert rf_config.dit_config.arch_config.num_frames_per_block == 3
+    assert rf_config.dit_config.arch_config.sliding_window_num_frames == 21
+
+
 def test_self_forcing_deployment_config_keeps_vae_and_text_encoder_resident():
     from sglang.multimodal_gen.configs.pipeline_configs.wan import (
         RollingForcingWanT2V480PConfig,
