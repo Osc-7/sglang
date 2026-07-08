@@ -153,6 +153,9 @@ def run_generate(
     if profile_path.is_file():
         with profile_path.open(encoding="utf-8") as handle:
             profile = json.load(handle)
+        profile["wall_s"] = wall_s
+        with profile_path.open("w", encoding="utf-8") as handle:
+            json.dump(profile, handle, indent=2)
         print_metric_report(compute_streaming_metrics(profile))
     return wall_s
 
