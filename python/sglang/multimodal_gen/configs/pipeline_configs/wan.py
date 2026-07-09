@@ -316,3 +316,7 @@ class RollingForcingWanT2V480PConfig(SelfForcingWanT2V480PConfig):
         # max-autotune can fail on RF's large causal attention shapes; use default
         # when the user opts into --enable-torch-compile.
         self.dit_config.torch_compile_mode = "default"
+        # Match Official Rolling Forcing (pipeline.to(bf16)): Wan VAE decode in
+        # bf16 is ~1.8x faster than the WanT2V default fp32 on H100, with
+        # negligible output drift in microbench.
+        self.vae_precision = "bf16"

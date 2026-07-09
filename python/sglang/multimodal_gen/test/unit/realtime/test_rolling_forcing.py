@@ -109,6 +109,7 @@ def test_rolling_forcing_config_enables_attention_sink():
     assert rf_config.dit_config.arch_config.sink_size == 3
     assert rf_config.dit_config.arch_config.num_frames_per_block == 3
     assert rf_config.dit_config.arch_config.sliding_window_num_frames == 21
+    assert rf_config.vae_precision == "bf16"
 
 
 def test_self_forcing_deployment_config_keeps_vae_and_text_encoder_resident():

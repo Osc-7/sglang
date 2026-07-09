@@ -283,3 +283,9 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Local-only: fork push helper (not part of WM-2 branch)
+scripts/setup_private_fork_and_push.sh
+
+.cargo/
+.rustup/

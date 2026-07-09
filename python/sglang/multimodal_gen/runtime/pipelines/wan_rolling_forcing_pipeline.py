@@ -105,21 +105,38 @@ class WanRollingForcingPipeline(LoRAPipeline, ComposedPipelineBase):
             extra_one_step=True,
         )
 
-        checkpoint_path = getattr(
-            pcfg, "rolling_forcing_checkpoint_path", _DEFAULT_RF_CHECKPOINT
+        # CLI `--rolling-forcing-checkpoint-path X` lands in
+        # server_args.component_paths["rolling_forcing_checkpoint"] via the
+        # generic --<component>-path extractor; it takes priority over the
+        # pipeline config default.
+        checkpoint_path = server_args.component_paths.get(
+            "rolling_forcing_checkpoint"
         )
+        if checkpoint_path is None:
+            checkpoint_path = getattr(
+                pcfg, "rolling_forcing_checkpoint_path", _DEFAULT_RF_CHECKPOINT
+            )
         use_ema = getattr(pcfg, "rolling_forcing_use_ema", True)
-        if checkpoint_path and os.path.isfile(checkpoint_path):
-            load_rolling_forcing_generator_checkpoint(
-                self.get_module("transformer"),
-                checkpoint_path,
-                use_ema=use_ema,
-            )
-        else:
+        if not checkpoint_path:
+            # Explicit opt-out (empty path): run with base Wan weights.
             logger.warning(
-                "Rolling Forcing checkpoint not found at %s; using base transformer weights",
-                checkpoint_path,
+                "Rolling Forcing checkpoint disabled; using base transformer weights"
             )
+            return
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                f"Rolling Forcing checkpoint not found at {checkpoint_path!r}. "
+                "Pass --rolling-forcing-checkpoint-path /path/to/rolling_forcing_dmd.pt "
+                "(or set rolling_forcing_checkpoint_path in the pipeline config). "
+                "To intentionally run with base Wan weights, pass "
+                "--rolling-forcing-checkpoint-path ''."
+            )
+        logger.info("Loading Rolling Forcing checkpoint from %s", checkpoint_path)
+        load_rolling_forcing_generator_checkpoint(
+            self.get_module("transformer"),
+            checkpoint_path,
+            use_ema=use_ema,
+        )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
